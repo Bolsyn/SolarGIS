@@ -1,0 +1,2 @@
+# SolarGIS
+Diplom Project 
