@@ -8,9 +8,11 @@ from qgis.core import (
     QgsCoordinateTransform
     )
 import processing
+from grass_session import Session
+from grass.pygrass.modules.shortcuts import raster as r
+from grass.pygrass.modules import Module
 
-TMP = QgsProcessing.TEMPORARY_OUTPUT
-# --- 1. НАСТРОЙКИ ---
+# --- 1. SETTINGS ---
 BUILDINGS_LAYER_NAME   = "bratislavsky — multipolygons"
 DSM_RASTER_LAYER_NAME  = "dsm_bratislava"
 
@@ -23,15 +25,15 @@ PERFORMANCE_RATIO = 0.85
 LINKE_TURBIDITY   = 3.0
 days_to_simulate  = [80, 172, 264, 355]
 
-print("--- НАЧАЛО РАБОТЫ СКРИПТА ---")
+print("--- BEGIN OF SCRIPT ---")
 
-# --- 2. ПОИСК СЛОЁВ И ОБЪЕКТА ---
+# --- 2.BUILDING SEARCH ---
 project = QgsProject.instance()
 
 def get_layer_by_name(name: str):
     layers = project.mapLayersByName(name)
     if not layers:
-        raise Exception(f"Слой '{name}' не найден. Проверьте точное имя в панели Layers.")
+        raise Exception(f"Layer '{name}' didn't find'. Check the name in Layers.")
     return layers[0]
 
 buildings_layer = get_layer_by_name(BUILDINGS_LAYER_NAME)
@@ -50,11 +52,11 @@ for f in buildings_layer.getFeatures():
         found_feature = f
         break
 if not found_feature:
-    raise Exception(f"Ошибка: Не удалось найти здание по координатам ({TARGET_LAT}, {TARGET_LON}).")
+    raise Exception(f"Error: Building not founded ({TARGET_LAT}, {TARGET_LON}).")
 
-print(f"Здание найдено (FID: {found_feature.id()}). Начинаем подготовку.")
+print(f"Building founded (FID: {found_feature.id()}). Preperation begining.")
 
-# --- 3. ПОДГОТОВКА ДАННЫХ ---
+# --- 3. DATA PREPARE ---
 feature_geom  = found_feature.geometry()
 buffer_geom   = feature_geom.buffer(BUFFER_SIZE_METERS, 8)
 buffer_extent = buffer_geom.boundingBox()
@@ -67,86 +69,99 @@ processing.run("gdal:cliprasterbyextent", {
     "PROJWIN": f"{buffer_extent.xMinimum()},{buffer_extent.xMaximum()},{buffer_extent.yMinimum()},{buffer_extent.yMaximum()}",
     "OUTPUT": clipped_dsm_path
 })
-print(f"DSM обрезан до области интереса: {clipped_dsm_path}")
+print(f"DSM prepeared: {clipped_dsm_path}")
 
-# --- 3.1. ПРЕДВАРИТЕЛЬНЫЙ РАСЧЕТ АСПЕКТА И УКЛОНА ---
+# --- 3.1. CALCULATION OF ASPECT AND SLOPE ---
 aspect_path = os.path.join(home_dir, "temp_aspect.tif")
 slope_path = os.path.join(home_dir, "temp_slope.tif")
 
-print("Расчет растра аспекта (ориентации склонов)...")
+print("Calculation of aspect...")
 processing.run("gdal:aspect", {'INPUT': clipped_dsm_path, 'OUTPUT': aspect_path})
 
-print("Расчет растра уклона...")
+print("Calculation of slope")
 processing.run("gdal:slope", {
     'INPUT': clipped_dsm_path, 'SLOPE_EXPRESSED_IN_DEGREES': True, 'OUTPUT': slope_path
 })
 
-# --- 3.2. СОЗДАНИЕ СЛОЯ С ОДНИМ ЗДАНИЕМ ---
+# --- 3.2. LAYER WITH ONE BUILDING ---
 tmp_building_gpkg = os.path.join(home_dir, "temp_building.gpkg")
 buildings_layer.removeSelection()
 buildings_layer.select(found_feature.id())
 one_building = processing.run("native:saveselectedfeatures", {
     "INPUT": buildings_layer,
-    "OUTPUT": "memory:"  # вместо сохранения в файл
+    "OUTPUT": "memory:"
 })["OUTPUT"]
 
-# --- 4. РАСЧЕТ В GRASS ---
+# --- 4. CALCULATION IN GRASS ---
+def rsun_pygrass(
+    dsm_path, aspect_path, slope_path,
+    day, linke_turbidity,
+    beam_tif, diff_tif, glob_tif,
+    time_of_day=12.0, nprocs=4
+):
+    with Session.from_raster(dsm_path):
+        elev_name, aspect_name, slope_name = "elev_in", "aspect_in", "slope_in"
+        beam_name, diff_name, glob_name = "beam_out", "diff_out", "glob_out"
+
+        
+        r.in_gdal(input=dsm_path, output=elev_name, overwrite=True)
+        Module("g.region", raster=elev_name)
+
+        
+        if aspect_path and os.path.exists(aspect_path):
+            r.in_gdal(input=aspect_path, output=aspect_name, overwrite=True)
+        if slope_path and os.path.exists(slope_path):
+            r.in_gdal(input=slope_path, output=slope_name, overwrite=True)
+        if not os.path.exists(aspect_path) or not os.path.exists(slope_path):
+            Module("r.slope.aspect", elevation=elev_name,
+                   slope=slope_name, aspect=aspect_name, overwrite=True)
+
+        
+        Module("r.sun",
+               elevation=elev_name,
+               aspect=aspect_name,
+               slope=slope_name,
+               day=day,
+               time=time_of_day,
+               linke_value=linke_turbidity,
+               beam_rad=beam_name,
+               diffuse_rad=diff_name,
+               glob_rad=glob_name,
+               nprocs=nprocs,
+               flags="i",
+               overwrite=True)
+
+        
+        r.out_gdal(input=beam_name, output=beam_tif, format="GTiff", overwrite=True)
+        r.out_gdal(input=diff_name, output=diff_tif, format="GTiff", overwrite=True)
+        r.out_gdal(input=glob_name, output=glob_tif, format="GTiff", overwrite=True)
+
 annual_insolation_sum_wh_m2 = 0.0
 
 for day in days_to_simulate:
-    print(f"День {day}: расчёт прямой и рассеянной радиации...")
-    beam_tif = os.path.join(home_dir, f"temp_beam_day_{day}.tif")
-    diff_tif = os.path.join(home_dir, f"temp_diff_day_{day}.tif")
-    glob_tif = os.path.join(home_dir, f'temp_global_rad_day_{day}.tif')
-    
-    res = None
-    
-    try:
-        res = processing.run("grass:r.sun.incidout", {
-            "elevation": clipped_dsm_path,
-            "aspect": aspect_path,          # можно поставить None, r.sun сам возьмет из DEM
-            "slope": slope_path,            # можно поставить None
-            "dayofyear": day,
-            "time": 12.0,                   # обязателен оберткой; при 'i' не влияет
-            "linke": LINKE_TURBIDITY,
-            "beam_rad": beam_tif,
-            "diff_rad": diff_tif,
-            "refl_rad": None,
-            "glob_rad": glob_tif,   # это уже прямая+рассеянная (+отраженная, если задавать)
-            "flags": "i",                   # интеграция за день → Wh/m²
-            "nprocs": 4,
-            "GRASS_REGION_PARAMETER": None,
-            "GRASS_REGION_CELLSIZE_PARAMETER": 0,
-            "GRASS_RASTER_FORMAT_OPT": "",
-            "GRASS_RASTER_FORMAT_META": ""
-            })
-    except Exception as e:
-        print("!!! ПРОИЗОШЛА КРИТИЧЕСКАЯ ОШИБКА ПРИ ВЫЗОВЕ АЛГОРИТМА GRASS !!!")
-        print(f"Текст ошибки: {e}")
-        print("Пожалуйста, убедитесь, что GRASS активирован в 'Настройки -> Обработка -> Провайдеры'.")
-        raise
-    
-    # если результат не получен — пропускаем день
-    if not res:
-        print(f"⚠️ GRASS не вернул результат для дня {day}, пропуск...")
-        continue
+    print(f"\n=== Day {day}: calculation radiation ===")
+    beam_tif = os.path.join(home_dir, f"beam_day_{day}.tif")
+    diff_tif = os.path.join(home_dir, f"diff_day_{day}.tif")
+    glob_tif = os.path.join(home_dir, f"glob_day_{day}.tif")
 
-    # Проверяем наличие ключей
-    missing = [k for k in ("beam_rad", "diff_rad", "glob_rad") if k not in res or not res[k]]
-    if missing:
-        print(f"⚠️ Пропущены ключи {missing} в результате GRASS — день {day} пропущен.")
-        continue
-    
-    beam_layer = res["beam_rad"]
-    diff_layer = res["diff_rad"]
-    glob_layer = res["glob_rad"]     # основной результат
+    try:
+        rsun_pygrass(clipped_dsm_path, aspect_path, slope_path,
+                     day, LINKE_TURBIDITY,
+                     beam_tif, diff_tif, glob_tif)
+    except Exception as e:
+        print(f"Error in GRASS r.sun: {e}")
+        continue       
+    beam_layer = r["beam_rad"]
+    diff_layer = r["diff_rad"]
+    glob_layer = r["glob_rad"]    
+ 
     
     zs_beam = processing.run("native:zonalstatisticsfb", {
         "INPUT": one_building,
         "INPUT_RASTER": beam_tif,
         "RASTER_BAND": 1,
         "COLUMN_PREFIX": f"b{day}_",
-        "STATISTICS": [0]  # mean
+        "STATISTICS": [0]
     })["OUTPUT"]
 
     zs_diff = processing.run("native:zonalstatisticsfb", {
@@ -165,15 +180,18 @@ for day in days_to_simulate:
         "STATISTICS": [0]
     })["OUTPUT"]
 
-    eat = next(zs_glob.getFeatures())
+    feat = next(zs_glob.getFeatures())
     beam_mean = float(feat.get(f"b{day}_mean", 0) or 0)
     diff_mean = float(feat.get(f"d{day}_mean", 0) or 0)
     glob_mean = float(feat.get(f"g{day}_mean", 0) or 0)
     
-    annual_insolation_sum_wh_m2 += daily_global_Wh_m2
-    print(f"  Прямая={beam_mean:.1f} Вт·ч/м², Рассеянная={diff_mean:.1f} Вт·ч/м², Сумма={daily_global_wh_m2:.1f} Вт·ч/м²")
+    daily_global_wh_m2 = glob_mean
+    annual_insolation_sum_wh_m2 += daily_global_wh_m2
 
-# --- 5. ИТОГОВЫЙ РАСЧЁТ ---
+    print(f"  Beam={beam_mean:.1f} Wh/m², Diff={diff_mean:.1f} Wh/m², Sum={glob_mean:.1f} Wh/m²")
+
+
+# --- 5. Result ---
 if annual_insolation_sum_wh_m2 > 0:
     average_daily_insolation_wh_m2 = annual_insolation_sum_wh_m2 / len(days_to_simulate)
     annual_insolation_kwh_m2       = (average_daily_insolation_wh_m2 * 365.0) / 1000.0
@@ -181,10 +199,10 @@ if annual_insolation_sum_wh_m2 > 0:
     building_area_m2 = feature_geom.area()
     potential_power_kwh_year = building_area_m2 * annual_insolation_kwh_m2 * PANEL_EFFICIENCY * PERFORMANCE_RATIO
 
-    print("\n--- РАСЧЁТ СОЛНЕЧНОГО ПОТЕНЦИАЛА ЗАВЕРШЁН ---")
-    print(f"Площадь крыши (2D проекция): {building_area_m2:.2f} м²")
-    print(f"Среднегодовая инсоляция (расчетная): {annual_insolation_kwh_m2:.2f} кВт·ч/м² в год")
-    print(f"Потенциальная выработка: {potential_power_kwh_year:.2f} кВт·ч в год")
-    print("-----------------------------------------------------------------")
+    print("\n--- SOLAR POTENTIAL CALCULATION COMPLETED ---")
+    print(f"Roof area (2D projection): {building_area_m2:.2f} m²")
+    print(f"Average annual insolation (calculated): {annual_insolation_kwh_m2:.2f} kWh/m² per year")
+    print(f"Potential energy yield: {potential_power_kwh_year:.2f} kWh per year")
+    print("---------------------------------------------------------------")
 else:
-    print("\nОШИБКА: Не удалось рассчитать итоговую инсоляцию. Проверьте входные данные и логи в консоли.")
+    print("\nERROR: Failed to calculate the total insolation. Check input data and console logs.")
