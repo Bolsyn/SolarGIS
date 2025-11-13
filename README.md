@@ -1,3 +1,5 @@
 # SolarGIS
 Diplom Project 
-Didn't Working
+Grass proccessing - Didn't Working
+
+
