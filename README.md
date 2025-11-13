@@ -3,5 +3,7 @@ Diplom Project
 
 Grass proccessing - Didn't Working 29.10.2025
 
-New start Coding.
+Coudn't create files in code directory 13.11.2025
+
+
 
